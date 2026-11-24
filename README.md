@@ -101,6 +101,28 @@
      该方式用 `setsid` 后台 detached 执行 `bt restart`，即便终端随后被断开也不影响迁移结果。
    - 任何时候你也可以手动在**新终端**执行 `bt restart` 强制刷新。
 
+7. **php-fpm 重启可能"假成功"**：A 上旧的 php-fpm master 若正在服务大量请求，宝塔 init 脚本的
+   平滑关闭（SIGQUIT）可能超时（提示 `failed. Use force-quit`），随后新进程因 socket/pid 被占而
+   启动失败——此时**旧 master 仍在跑旧二进制，但 socket 文件存在**，容易误判为成功。
+   脚本已针对此做了处理：stop 后仍检测到旧 master 就 TERM→KILL 强制结束，清理残留 pid/socket 再启动；
+   验证方式改为检查 master 进程的 `/proc/PID/exe`（带 `(deleted)` 说明还是旧二进制），不再只看 socket 是否存在。
+   失败时会打印 `php-fpm -t` 输出与 `var/log/php-fpm.log` 尾部，便于定位。
+   手动排查时可用：`readlink /proc/$(pgrep -f "php-fpm: master process.*php/82" | head -1)/exe`。
+
+8. **A 上是否需要新增 `php-fpm-<V>.service`**：不需要手写 unit。宝塔在 CentOS 上是用
+   `/etc/init.d/php-fpm-<V>` + `chkconfig` 管理 PHP 的，systemd 会自动为它生成 LSB 包装单元
+   （`systemctl list-units --type=service | grep fpm` 里显示 `LSB: starts php-fpm` 的那种，例如
+   A 上原有的 `php-fpm-80.service`）。迁移后只需：
+   ```bash
+   chkconfig --add php-fpm-82          # 注册开机启动项
+   systemctl enable php-fpm-82         # 让 systemd 生成/加载 LSB 包装单元
+   systemctl start  php-fpm-82
+   systemctl status php-fpm-82         # 应显示 active (running) + LSB: starts php-fpm
+   ```
+   脚本里已自动执行 enable/start；只有当 A 上**既没有 init.d 脚本也没有 unit 文件**时，
+   才会自动生成一个真正的 systemd 单元兜底（内容指向 `/www/server/php/<V>/sbin/php-fpm`）。
+   ⚠️ 不建议在已有 init.d 脚本的情况下另写 unit——宝塔面板本身调 init.d 启停，两套管理会状态错乱。
+
 ## 文件清单
 
 ```
