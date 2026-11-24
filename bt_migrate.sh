@@ -161,7 +161,31 @@ php_restore() {
   local VERSIONS=($(cat php_versions.list))
   echo "==> 将还原版本：${VERSIONS[*]}"
 
+  # 0) 备份 A 上已有版本的 etc 配置（php.ini / php-fpm.conf 等），还原后恢复，避免被 B 的配置覆盖
+  mkdir -p /www/backup
+  local ETC_BAK="/www/backup/php_etc.a.bak_$(date +%s)"
+  mkdir -p "$ETC_BAK"
+  local HAD_ETC=0
+  for V in "${VERSIONS[@]}"; do
+    if [ -d "$PHP_BASE/$V/etc" ]; then
+      cp -a "$PHP_BASE/$V/etc" "$ETC_BAK/$V"
+      HAD_ETC=1
+    fi
+  done
+  if [ "$HAD_ETC" -eq 1 ]; then
+    echo "==> 已备份 A 原有 PHP 配置到 $ETC_BAK"
+  fi
+
   tar xzf php_dir.tar.gz   -C "$PHP_BASE/"
+
+  # 0.5) 恢复 A 原有 PHP 配置（保持原有配置优先；A 没装过该版本时用 B 自带的）
+  for V in "${VERSIONS[@]}"; do
+    if [ -d "$ETC_BAK/$V" ]; then
+      cp -a "$ETC_BAK/$V/." "$PHP_BASE/$V/etc/"
+      echo "==> 已恢复 A 原有 php$V 配置（etc/）"
+    fi
+  done
+
   tar xzf php_panel.tar.gz -C /www/server/panel/data/ 2>/dev/null || true
   tar xzf php_libs.tar.gz  -C / 2>/dev/null || true
   tar xzf php_ldso.tar.gz  -C / 2>/dev/null || true
@@ -174,10 +198,10 @@ php_restore() {
     if [ -f /usr/lib/systemd/system/php-fpm-$V.service ] || [ -f /lib/systemd/system/php-fpm-$V.service ]; then
       systemctl daemon-reload
       systemctl enable php-fpm-$V.service
-      if systemctl restart php-fpm-$V.service 2>/dev/null; then RESTART_BT=1; fi
+      if systemctl restart php-fpm-$V.service 2>/dev/null; then RESTART_BT=1; else echo "  注意：php-fpm-$V 启动失败，可能是 A 原配置与新版不兼容，请检查 $PHP_BASE/$V/etc/"; fi
     elif [ -f /etc/init.d/php-fpm-$V ]; then
       chkconfig --add php-fpm-$V 2>/dev/null || update-rc.d php-fpm-$V defaults 2>/dev/null || true
-      if /etc/init.d/php-fpm-$V restart 2>/dev/null; then RESTART_BT=1; fi
+      if /etc/init.d/php-fpm-$V restart 2>/dev/null; then RESTART_BT=1; else echo "  注意：php-fpm-$V 启动失败，可能是 A 原配置与新版不兼容，请检查 $PHP_BASE/$V/etc/"; fi
     else
       echo "  警告：未找到 php-fpm-$V 服务文件，目录已就位但未启动"
     fi
@@ -278,18 +302,30 @@ nginx_restore() {
   pkill -9 nginx 2>/dev/null || true
   sleep 1
 
-  # 2) 备份 A 的原 conf（供必要时手动回滚；二进制来自 B，conf 须匹配 B 的编译特性，故默认用 B 的 conf 覆盖）
-  if [ -f "$NGX/conf/nginx.conf" ]; then
-    cp -a "$NGX/conf/nginx.conf" "/www/backup/nginx.conf.a.bak_$(date +%s)"
-    echo "==> 已备份 A 的原 nginx.conf 到 /www/backup（如 A 有自定义配置，请参考该备份手动合并）"
+  # 2) 备份 A 的原 conf 整目录（保持原有配置优先；校验失败才回退 B 的 conf）
+  mkdir -p /www/backup
+  local A_CONF_BAK=""
+  if [ -d "$NGX/conf" ]; then
+    A_CONF_BAK="/www/backup/nginx_conf.a.bak_$(date +%s)"
+    cp -a "$NGX/conf" "$A_CONF_BAK"
+    echo "==> 已备份 A 的原 conf 目录到 $A_CONF_BAK"
   fi
 
   # 2.5) 备份旧二进制便于回滚
-  mkdir -p /www/backup
   [ -f "$NGX/sbin/nginx" ] && cp -a "$NGX/sbin/nginx" "/www/backup/nginxBak_$(date +%s)" 2>/dev/null || true
 
-  # 3) 还原 nginx 主目录（覆盖，conf/nginx.conf 来自 B，与 B 二进制同源）
+  # 3) 还原 nginx 主目录（B 的 conf 与 B 二进制同源，先落地）
   tar xzf nginx_dir.tar.gz -C "$ROOT_PATH/"
+
+  # 3.5) 暂存 B 的 conf（供 A 配置校验失败时自动回退）
+  local B_CONF_BAK="$WORK/nginx_conf.b.bak"
+  cp -a "$NGX/conf" "$B_CONF_BAK"
+
+  # 4) 恢复 A 的原有配置（保持原有配置优先；A 没装过 nginx 时保留 B 的）
+  if [ -n "$A_CONF_BAK" ]; then
+    cp -a "$A_CONF_BAK/." "$NGX/conf/"
+    echo "==> 已恢复 A 的原有 conf（保持原有配置）"
+  fi
 
   # 5) 还原面板 md5、依赖库、ld.so、服务文件
   tar xzf nginx_panel.tar.gz -C /www/server/panel/data/ 2>/dev/null || true
@@ -301,14 +337,23 @@ nginx_restore() {
   # 6) 命令行软链（指向新版本）
   ln -sf "$NGX/sbin/nginx" /usr/bin/nginx
 
-  # 7) 启动前配置自检 + lua 兼容性兜底
+  # 7) 启动前校验：lua 兼容兜底 + nginx -t，失败自动回退 B 的 conf 保证可启动
   echo "==> 校验配置 ..."
   if ! "$NGX/sbin/nginx" -V 2>&1 | grep -qi 'lua'; then
     echo "    检测到 nginx 未编译 lua 模块，自动注释 conf 中的 lua 指令（如需 lua 功能请先在 B 重新编译带 lua 的 nginx）"
     sed -i '/lua_package_path/s/^/#/' "$NGX/conf/nginx.conf"
     sed -i '/include.*luawaf.conf/s/^/#/' "$NGX/conf/nginx.conf"
   fi
-  nginx -t 2>&1 | tail -8 || echo "  警告：nginx -t 未通过，请检查配置（仍尝试启动）"
+  local T_OUT T_FAIL=0
+  T_OUT=$("$NGX/sbin/nginx" -t 2>&1) || T_FAIL=1
+  echo "$T_OUT" | tail -8
+  if [ "$T_FAIL" -eq 1 ] && [ -n "$A_CONF_BAK" ]; then
+    echo "  A 的原配置与新二进制不兼容，自动回退为 B 自带 conf（保证 nginx 可启动）"
+    rm -rf "$NGX/conf"
+    cp -a "$B_CONF_BAK" "$NGX/conf"
+    "$NGX/sbin/nginx" -t 2>&1 | tail -4 || true
+    echo "  A 原配置备份在 $A_CONF_BAK，请手动合并差异后覆盖 $NGX/conf/nginx.conf"
+  fi
 
   # 8) 启动
   echo "==> 启动 nginx ..."

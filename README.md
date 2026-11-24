@@ -72,10 +72,13 @@
 
 ## 注意事项 / 已知坑
 
-1. **nginx 的 conf 必须与二进制同源**：A 原 nginx 的 `conf/nginx.conf` 不会被保留，
-   还原时改用 B 自带的 `nginx.conf`（与 B 二进制编译特性一致）。
-   A 原 conf 会备份到 `/www/backup/nginx.conf.a.bak_<时间戳>`，有自定义 server 块可参考手动合并。
-   旧二进制同样备份到 `/www/backup/nginxBak_<时间戳>` 便于回滚。
+1. **原有配置不会被覆盖（A 配置优先）**：`restore` 会先备份 A 的原配置，还原后自动放回去——
+   - **PHP**：每个版本还原前备份 A 已有的 `etc/`（php.ini、php-fpm.conf 等）到
+     `/www/backup/php_etc.a.bak_<时间戳>/`，解压后恢复回去。A 没装过该版本时用 B 自带配置。
+   - **nginx**：还原前备份 A 的整个 `conf/` 目录到 `/www/backup/nginx_conf.a.bak_<时间戳>/`，
+     解压后恢复回去。旧二进制同样备份到 `/www/backup/nginxBak_<时间戳>` 便于回滚。
+   - **兜底**：恢复 A 配置后脚本会跑 `nginx -t` 校验，若 A 原配置与新二进制不兼容（如引用了
+     新版没有的模块指令），自动回退为 B 自带 conf 保证 nginx 能启动，并提示手动合并差异。
 
 2. **lua 模块兼容**：若 B 编译 nginx 时未带 lua 模块、而 A 原配置里有 `lua_package_path` 等指令，
    还原脚本会在启动前自动检测并注释掉这些 lua 指令，保证 nginx 能起来。
